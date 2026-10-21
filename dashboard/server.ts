@@ -49,9 +49,13 @@ import {
   type MatchmakingEngine,
   type AgentDocument,
 } from "./lib/matchmaking.js";
+import { SlidingWindowRateLimiter } from "./lib/rateLimiter.js";
+import { IssuedChallengeStore } from "./lib/authChallenges.js";
+import { parseAllowedOrigins } from "./lib/origins.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getReadOnlyDb } from "../../indexer/src/db.js";
 import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
+import { getJobEventType, matchesJobEvent } from "./lib/jobEvents.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -458,104 +462,6 @@ const allowedOrigins = [
 // which avoids the boundary-bursting problem of fixed-window counters. Expired
 // entries are pruned periodically so memory stays bounded under many distinct
 // IP probes.
-export type SlidingWindowResult = {
-  allowed: boolean;
-  limit: number;
-  remaining: number;
-  /** Seconds until the oldest in-window request expires (0 when allowed). */
-  retryAfterSeconds: number;
-};
-
-export class SlidingWindowRateLimiter {
-  private readonly buckets = new Map<string, number[]>();
-  private readonly limit: number;
-  private readonly windowMs: number;
-  private readonly pruneIntervalMs: number;
-  private pruneTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly now: () => number;
-
-  constructor(options: {
-    limit: number;
-    windowMs: number;
-    pruneIntervalMs?: number;
-    now?: () => number;
-  }) {
-    this.limit = Math.max(1, Math.floor(options.limit));
-    this.windowMs = Math.max(1, Math.floor(options.windowMs));
-    this.pruneIntervalMs = Math.max(1, Math.floor(options.pruneIntervalMs ?? 5 * 60_000));
-    this.now = options.now ?? Date.now;
-    this.startPruning();
-  }
-
-  /** Record a request for `key` and report whether it is allowed. */
-  check(key: string): SlidingWindowResult {
-    const now = this.now();
-    const windowStart = now - this.windowMs;
-    let timestamps = this.buckets.get(key);
-    if (!timestamps) {
-      timestamps = [];
-      this.buckets.set(key, timestamps);
-    }
-    // Drop timestamps that have fallen out of the sliding window.
-    let expired = 0;
-    while (expired < timestamps.length && timestamps[expired] <= windowStart) {
-      expired += 1;
-    }
-    if (expired > 0) timestamps.splice(0, expired);
-
-    if (timestamps.length >= this.limit) {
-      const oldest = timestamps[0];
-      const retryAfterMs = Math.max(0, oldest + this.windowMs - now);
-      return {
-        allowed: false,
-        limit: this.limit,
-        remaining: 0,
-        retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
-      };
-    }
-
-    timestamps.push(now);
-    return {
-      allowed: true,
-      limit: this.limit,
-      remaining: Math.max(0, this.limit - timestamps.length),
-      retryAfterSeconds: 0,
-    };
-  }
-
-  /** Remove all keys whose timestamps have fully expired. */
-  prune(): void {
-    const windowStart = this.now() - this.windowMs;
-    for (const [key, timestamps] of this.buckets) {
-      let expired = 0;
-      while (expired < timestamps.length && timestamps[expired] <= windowStart) {
-        expired += 1;
-      }
-      if (expired > 0) timestamps.splice(0, expired);
-      if (timestamps.length === 0) this.buckets.delete(key);
-    }
-  }
-
-  /** Number of tracked keys (exposed for tests / metrics). */
-  size(): number {
-    return this.buckets.size;
-  }
-
-  /** Stop the background pruning timer. */
-  stop(): void {
-    if (this.pruneTimer) {
-      clearInterval(this.pruneTimer);
-      this.pruneTimer = null;
-    }
-  }
-
-  private startPruning(): void {
-    this.pruneTimer = setInterval(() => this.prune(), this.pruneIntervalMs);
-    // Do not keep the Node.js event loop alive solely for pruning.
-    this.pruneTimer.unref?.();
-  }
-}
-
 const MUTATING_RATE_LIMIT = Number(process.env.MUTATING_RATE_LIMIT ?? 30);
 const MUTATING_RATE_WINDOW_MS = Number(process.env.MUTATING_RATE_WINDOW_MS ?? 60_000);
 
@@ -843,6 +749,11 @@ const SEP10_SERVER_KEYPAIR = process.env.SEP10_SERVER_SECRET
 const SEP10_HOME_DOMAIN = process.env.SEP10_HOME_DOMAIN ?? "localhost";
 const SEP10_WEB_AUTH_DOMAIN = process.env.SEP10_WEB_AUTH_DOMAIN ?? SEP10_HOME_DOMAIN;
 const SEP10_CHALLENGE_TIMEOUT_SECONDS = 300;
+const challengeRateLimiter = new SlidingWindowRateLimiter({
+  limit: 10,
+  windowMs: 60_000,
+});
+const issuedChallenges = new IssuedChallengeStore({ ttlMs: 5 * 60_000 });
 
 /**
  * GET /api/auth/challenge — Issue a SEP-0010 challenge transaction.
@@ -850,16 +761,30 @@ const SEP10_CHALLENGE_TIMEOUT_SECONDS = 300;
  * Returns the base64 challenge XDR for the wallet to sign.
  */
 app.get("/api/auth/challenge", async (req, res) => {
+  const rate = challengeRateLimiter.check(req.ip || "unknown");
+  res.setHeader("X-RateLimit-Limit", String(rate.limit));
+  res.setHeader("X-RateLimit-Remaining", String(rate.remaining));
+  if (!rate.allowed) {
+    res.setHeader("Retry-After", String(rate.retryAfterSeconds));
+    res.status(429).json({ error: "challenge rate limit exceeded" });
+    return;
+  }
+
   try {
     const publicKeySchema = z.object({
       publicKey: stellarAddressSchema,
     });
     const parsed = publicKeySchema.parse(req.query);
-    const account = await tracedRpc(
-      "getAccount",
-      { "rpc.method": "getAccount", "stellar.account": parsed.publicKey },
-      () => withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey)),
-    );
+    try {
+      await tracedRpc(
+        "getAccount",
+        { "rpc.method": "getAccount", "stellar.account": parsed.publicKey },
+        () => withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey)),
+      );
+    } catch {
+      res.status(400).json({ error: "Unable to verify Stellar account" });
+      return;
+    }
     const challengeTx = Utils.buildChallengeTx(
       SEP10_SERVER_KEYPAIR,
       parsed.publicKey,
@@ -869,9 +794,7 @@ app.get("/api/auth/challenge", async (req, res) => {
       SEP10_WEB_AUTH_DOMAIN,
       cfg.networkPassphrase === Networks.PUBLIC ? undefined : cfg.networkPassphrase,
     );
-    // buildChallengeTx builds its own sequence number; the account lookup above
-    // validates the account exists on-chain before issuing a challenge.
-    void account;
+    issuedChallenges.issue(challengeTx.hash().toString("hex"));
     res.json({
       transaction: challengeTx.toXDR(),
       network_passphrase: cfg.networkPassphrase,
@@ -893,6 +816,23 @@ app.post("/api/auth/token", (req, res) => {
     });
     const parsed = authSchema.parse(req.body);
 
+    let challengeHash: string;
+    try {
+      challengeHash = TransactionBuilder.fromXDR(
+        parsed.transaction,
+        cfg.networkPassphrase,
+      )
+        .hash()
+        .toString("hex");
+    } catch {
+      res.status(401).json({ error: "Invalid or expired challenge transaction" });
+      return;
+    }
+    if (!issuedChallenges.has(challengeHash)) {
+      res.status(401).json({ error: "Invalid or expired challenge transaction" });
+      return;
+    }
+
     let clientPublicKey: string;
     try {
       clientPublicKey = Utils.verifyChallengeTx(
@@ -904,6 +844,11 @@ app.post("/api/auth/token", (req, res) => {
       );
     } catch (err: unknown) {
       res.status(401).json({ error: `Invalid challenge transaction: ${(err as Error).message}` });
+      return;
+    }
+
+    if (!issuedChallenges.consume(challengeHash)) {
+      res.status(401).json({ error: "Invalid or expired challenge transaction" });
       return;
     }
 
@@ -1385,12 +1330,64 @@ app.get("/api/admin/audit", requireAuth, (req, res) => {
   }
 });
 
+// ── #821: GET /api/jobs/:id/events — SSE stream for a single job ─────────────
+app.get("/api/jobs/:id/events", (req, res) => {
+  const parsedId = numericIdParamSchema.safeParse(req.params);
+  if (!parsedId.success) {
+    res.status(400).json({ error: "Invalid job ID" });
+    return;
+  }
+  const jobId = parsedId.data.id;
+  const contractId = getRequestNetwork(req).commerceContract;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  const send = (event: string, data: unknown, id?: string) => {
+    try {
+      if (id) res.write(`id: ${id}\n`);
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      // Client disconnect cleanup runs on the response's close event.
+    }
+  };
+  send("hello", { message: "connected", jobId: jobId.toString() });
+
+  const onEvent = (event: SorobanEvent) => {
+    if (matchesJobEvent(event, contractId, jobId)) {
+      const eventType = getJobEventType(event) ?? "event";
+      send(
+        eventType,
+        { ...event, eventType },
+        event.id === undefined ? undefined : String(event.id),
+      );
+    }
+  };
+  eventHub.on("event", onEvent);
+
+  const heartbeat = setInterval(() => {
+    send("ping", { t: Date.now() });
+  }, SSE_HEARTBEAT_MS);
+
+  res.on("close", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+});
+
 // ── #719: GET /api/events/stream — SSE stream of newly indexed events ────────
 // Supports filtering by contract, event_type, and address topic. Clients may
 // resume after a reconnect by sending Last-Event-ID; buffered events newer than
 // that id are replayed before live streaming resumes.
 app.get("/api/events/stream", (req, res) => {
-  const filter = parseEventFilter(req.query as Record<string, unknown>);
+  const filter = parseEventFilter({
+    ...req.query,
+    eventType: req.query.eventType ?? req.query.filter,
+  } as Record<string, unknown>);
   const lastEventId = req.header("last-event-id") ?? (req.query.lastEventId as string | undefined);
 
   res.setHeader("Content-Type", "text/event-stream");

@@ -1,5 +1,6 @@
 export * from "./types.js";
 export * from "./events.js";
+export * from "./subscribeJob.js";
 export * from "./errors.js";
 export { formatAmount, parseAmount, isValidMetadataUri } from "./format.js";
 // #706 — SHA-256 deliverable payload content hash helpers
